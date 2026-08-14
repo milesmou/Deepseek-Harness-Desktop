@@ -1,4 +1,4 @@
-# DeepSeek Harness Desktop (Tauri)
+# DeepSeek Harness (Tauri)
 
 用 Tauri 2 把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的本地 Web GUI 包装成 Windows 桌面应用。工程只保留**网络引导版**:不在 exe 中内置 Node 或 dsh 依赖,首次启动时按需准备运行环境。
 
@@ -8,11 +8,13 @@
 2. 探测 `http://127.0.0.1:3080`,已有 Harness 服务时直接接入;
 3. 系统同时存在可用的 Node 和 npm 时直接使用,否则自动安装便携 Node;
 4. 并行测试中国大陆源与官网源的连接延迟,选择更快的源;
-5. 读取本地 dsh 版本并查询远程最新版本,版本一致时跳过 `npm install`,仅在缺失或有更新时安装;
-6. 启动 dsh Web 服务,端口就绪后导航到 Harness GUI;
-7. 应用退出时只回收本应用启动的服务进程。
+5. 本地已安装 dsh 时立即启动 Web 服务,服务启动后再在后台查询最新版本;
+6. 发现新版本时弹窗提示并保存待更新标记;可选择“立即重启更新”,也可选择“下次启动更新”;
+7. 首次缺少 dsh 时仍会在启动阶段完成安装;
+8. 应用退出时只回收本应用启动的服务进程。
 
 读取到 dsh 版本后,窗口标题显示为 `DeepSeek Harness <dsh 版本>`。
+窗口和 WebView 的初始背景色与 loading 页统一为 `#0b0f1a`,避免启动和重启时闪白。
 
 ## 下载源
 
@@ -52,7 +54,7 @@ npm test
 publish.cmd
 ```
 
-`publish.cmd` 生成 `publish\DeepSeek Harness Desktop.exe`,不包含 Node 或 dsh 依赖。首次运行必须联网,后续启动会联网检查 dsh 更新。
+`publish.cmd` 生成 `publish\DeepSeek Harness.exe`,不包含 Node 或 dsh 依赖。首次运行必须联网;已安装 dsh 时先启动服务,再在后台检查更新。发现新版本会弹窗,可立即重启更新或留到下次启动时更新。
 
 ## 说明
 

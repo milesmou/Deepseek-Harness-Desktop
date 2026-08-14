@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "DeepSeek Harness Desktop",
+  "productName": "DeepSeek Harness",
   "version": "0.1.0",
   "identifier": "com.deepseek.harness.desktop",
   "build": {
@@ -15,6 +15,7 @@
         "height": 840,
         "minWidth": 960,
         "minHeight": 600,
+        "backgroundColor": "#0b0f1a",
         "center": true
       }
     ],

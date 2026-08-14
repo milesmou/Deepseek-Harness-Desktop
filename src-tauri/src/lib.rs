@@ -1,4 +1,4 @@
-//! DeepSeek Harness Desktop —— Tauri 桌面壳。
+//! DeepSeek Harness —— Tauri 桌面壳。
 //!
 //! 启动流程:
 //! 1. 打开本地 loading 页;
@@ -30,7 +30,7 @@ use std::{
 };
 
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewWindow};
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[cfg(feature = "bootstrap")]
 use std::net::ToSocketAddrs;
@@ -66,6 +66,8 @@ const BOOTSTRAP_NODE_SHA256: &str =
 const NPM_OFFICIAL_REGISTRY: &str = "https://registry.npmjs.org/";
 #[cfg(feature = "bootstrap")]
 const NPM_CHINA_REGISTRY: &str = "https://registry.npmmirror.com/";
+#[cfg(feature = "bootstrap")]
+const DSH_UPDATE_MARKER: &str = ".update-on-next-start";
 #[cfg(feature = "bootstrap")]
 const BOOTSTRAP_NODE_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -259,6 +261,17 @@ enum DshVersionDecision {
 }
 
 #[cfg(feature = "bootstrap")]
+fn is_newer_dsh_version(installed: &str, latest: &str) -> bool {
+    match (
+        semver::Version::parse(installed),
+        semver::Version::parse(latest),
+    ) {
+        (Ok(installed), Ok(latest)) => latest > installed,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "bootstrap")]
 fn decide_dsh_version(
     has_existing: bool,
     installed: Option<&str>,
@@ -268,10 +281,18 @@ fn decide_dsh_version(
         return DshVersionDecision::Install;
     }
     match (installed, latest) {
-        (Some(installed), Some(latest)) if installed == latest => DshVersionDecision::Current,
-        (_, Some(_)) => DshVersionDecision::Update,
+        (Some(installed), Some(latest)) if is_newer_dsh_version(installed, latest) => {
+            DshVersionDecision::Update
+        }
+        (Some(_), Some(_)) => DshVersionDecision::Current,
+        (None, Some(_)) => DshVersionDecision::Update,
         (_, None) => DshVersionDecision::UseExistingOffline,
     }
+}
+
+#[cfg(feature = "bootstrap")]
+fn start_before_update_check(has_existing: bool, has_pending_update: bool) -> bool {
+    has_existing && !has_pending_update
 }
 
 #[cfg(feature = "bootstrap")]
@@ -352,6 +373,49 @@ fn select_fastest_source(
         secondary_name,
         secondary_url,
     }
+}
+
+#[cfg(feature = "bootstrap")]
+fn select_fastest_source_silent(
+    kind: &str,
+    china_url: &'static str,
+    official_url: &'static str,
+    log: &Option<File>,
+) -> SourceChoice {
+    let (china_latency, official_latency) = thread::scope(|scope| {
+        let china = scope.spawn(|| measure_source_latency(china_url));
+        let official = scope.spawn(|| measure_source_latency(official_url));
+        (
+            china.join().unwrap_or(None),
+            official.join().unwrap_or(None),
+        )
+    });
+    let china_first = prefer_china_source(china_latency, official_latency);
+    let choice = if china_first {
+        SourceChoice {
+            primary_name: "中国大陆源",
+            primary_url: china_url,
+            secondary_name: "官网源",
+            secondary_url: official_url,
+        }
+    } else {
+        SourceChoice {
+            primary_name: "官网源",
+            primary_url: official_url,
+            secondary_name: "中国大陆源",
+            secondary_url: china_url,
+        }
+    };
+    log_line(
+        log,
+        &format!(
+            "{kind} 后台源测速:中国大陆 {}，官网 {}；选择 {}",
+            latency_text(china_latency),
+            latency_text(official_latency),
+            choice.primary_name
+        ),
+    );
+    choice
 }
 
 #[cfg(feature = "bootstrap")]
@@ -513,6 +577,52 @@ fn run_managed_capture(
         }
         thread::sleep(Duration::from_millis(150));
     }
+}
+
+#[cfg(feature = "bootstrap")]
+fn run_background_capture(
+    command: &mut Command,
+    label: &str,
+    log: &Option<File>,
+) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.stdin(Stdio::null()).stdout(Stdio::piped());
+    command.stderr(match log {
+        Some(file) => file
+            .try_clone()
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null()),
+        None => Stdio::null(),
+    });
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动{label}: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(150)),
+            Ok(None) => {
+                kill_tree(&mut child);
+                return Err(format!("{label}超过 30 秒"));
+            }
+            Err(error) => {
+                kill_tree(&mut child);
+                return Err(format!("无法查询{label}状态: {error}"));
+            }
+        }
+    };
+    let mut output = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout
+            .read_to_string(&mut output)
+            .map_err(|error| format!("无法读取{label}结果: {error}"))?;
+    }
+    status
+        .success()
+        .then(|| output.trim().to_string())
+        .ok_or_else(|| format!("{label}失败: {status}"))
 }
 
 /// 通过 `cmd /C` 执行命令串,不弹控制台窗口。
@@ -685,6 +795,162 @@ fn select_npx_dsh_root(npx_root: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or(preferred)
 }
 
+#[cfg(feature = "bootstrap")]
+fn schedule_background_update_check(
+    handle: &AppHandle,
+    node: std::path::PathBuf,
+    npm: std::path::PathBuf,
+    root: std::path::PathBuf,
+    installed_version: String,
+    log: &Option<File>,
+) {
+    let handle = handle.clone();
+    let background_log = log.as_ref().and_then(|file| file.try_clone().ok());
+    thread::spawn(move || {
+        let sources = select_fastest_source_silent(
+            "npm registry",
+            NPM_CHINA_REGISTRY,
+            NPM_OFFICIAL_REGISTRY,
+            &background_log,
+        );
+        let make_query = |registry: &str| -> Result<Command, String> {
+            let mut command = Command::new(&npm);
+            command
+                .args([
+                    "view",
+                    "@deepseek-ai/dsh",
+                    "version",
+                    "--json",
+                    "--loglevel=error",
+                ])
+                .args(["--registry", registry])
+                .env("NPM_CONFIG_REGISTRY", registry);
+            prepend_node_to_path(&mut command, &node)?;
+            Ok(command)
+        };
+        let mut primary = match make_query(sources.primary_url) {
+            Ok(command) => command,
+            Err(error) => {
+                log_line(&background_log, &format!("后台更新检查失败: {error}"));
+                return;
+            }
+        };
+        let primary_result = run_background_capture(
+            &mut primary,
+            &format!("dsh 后台版本检查（{}）", sources.primary_name),
+            &background_log,
+        )
+        .and_then(|output| parse_npm_view_version(&output));
+        let latest_version = match primary_result {
+            Ok(version) => version,
+            Err(primary_error) => {
+                log_line(
+                    &background_log,
+                    &format!(
+                        "{}后台查询失败:{primary_error};切换到{}",
+                        sources.primary_name, sources.secondary_name
+                    ),
+                );
+                let mut secondary = match make_query(sources.secondary_url) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        log_line(&background_log, &format!("后台更新检查失败: {error}"));
+                        return;
+                    }
+                };
+                match run_background_capture(
+                    &mut secondary,
+                    &format!("dsh 后台版本检查（{}）", sources.secondary_name),
+                    &background_log,
+                )
+                .and_then(|output| parse_npm_view_version(&output))
+                {
+                    Ok(version) => version,
+                    Err(secondary_error) => {
+                        log_line(
+                            &background_log,
+                            &format!(
+                                "dsh 后台更新检查失败;{}: {primary_error};{}: {secondary_error}",
+                                sources.primary_name, sources.secondary_name
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        log_line(
+            &background_log,
+            &format!("dsh 后台版本检查:本地={installed_version},最新={latest_version}"),
+        );
+        if !is_newer_dsh_version(&installed_version, &latest_version) {
+            return;
+        }
+        let marker = root.join(DSH_UPDATE_MARKER);
+        if let Err(error) = std::fs::write(&marker, &latest_version) {
+            log_line(
+                &background_log,
+                &format!("无法保存 dsh 待更新标记 {}: {error}", marker.display()),
+            );
+            return;
+        }
+        log_line(
+            &background_log,
+            &format!("发现 dsh 新版本 {latest_version},将在下次启动时更新"),
+        );
+        let restart_handle = handle.clone();
+        let callback_log = background_log
+            .as_ref()
+            .and_then(|file| file.try_clone().ok());
+        handle
+            .dialog()
+            .message(format!(
+                "发现 DeepSeek Harness 新版本 {latest_version}（当前 {installed_version}）。\n\n可以立即重启并更新,也可以留到下次启动时更新。"
+            ))
+            .title("DeepSeek Harness 更新")
+            .kind(MessageDialogKind::Info)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "立即重启更新".to_string(),
+                "下次启动更新".to_string(),
+            ))
+            .show(move |restart_now| {
+                if restart_now {
+                    log_line(&callback_log, "用户选择立即重启更新 dsh");
+                    restart_handle.request_restart();
+                } else {
+                    log_line(&callback_log, "用户选择下次启动时更新 dsh");
+                }
+            });
+    });
+}
+
+#[cfg(feature = "bootstrap")]
+fn spawn_dsh_web(
+    node: &std::path::Path,
+    root: &std::path::Path,
+    bin: &std::path::Path,
+    port: u16,
+    log: &Option<File>,
+) -> Result<(Child, String), String> {
+    let mut command = Command::new(node);
+    command
+        .arg(bin)
+        .args(["web", "--port", &port.to_string()])
+        .current_dir(root);
+    prepend_node_to_path(&mut command, node)?;
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let (stdin, stdout, stderr) = child_stdio(log);
+    command.stdin(stdin).stdout(stdout).stderr(stderr);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("无法启动网络安装的 dsh: {error}"))?;
+    Ok((
+        child,
+        format!("{} {} web --port {port}", node.display(), bin.display()),
+    ))
+}
+
 /// 网络引导版:确保 Node 可用,用 npm 安装/更新 dsh,再启动 Web 服务。
 #[cfg(feature = "bootstrap")]
 fn spawn_bootstrap_server(
@@ -717,6 +983,30 @@ fn spawn_bootstrap_server(
         .join("package.json");
     let had_existing = bin.is_file();
     let installed_version = read_npm_package_version(&package_json);
+    let update_marker = root.join(DSH_UPDATE_MARKER);
+    let has_pending_update = update_marker.is_file();
+    if start_before_update_check(had_existing, has_pending_update) {
+        let active_version = installed_version
+            .clone()
+            .unwrap_or_else(|| "未知".to_string());
+        log_line(
+            log,
+            &format!("使用已安装 dsh {active_version},启动后在后台检查更新"),
+        );
+        set_version_title(window, Some(&active_version));
+        set_loading_progress(window, 90, "已安装 DeepSeek Harness,正在直接启动…");
+        let spawned = spawn_dsh_web(&node, &root, &bin, port, log)?;
+        schedule_background_update_check(handle, node, npm, root, active_version, log);
+        return Ok(spawned);
+    }
+    if has_pending_update {
+        let requested = std::fs::read_to_string(&update_marker).unwrap_or_default();
+        log_line(
+            log,
+            &format!("检测到待更新标记,本次启动更新 dsh 到 {}", requested.trim()),
+        );
+        set_loading_progress(window, 46, "检测到待更新版本,正在准备更新…");
+    }
     let mut npm_sources = select_fastest_source(
         window,
         46,
@@ -900,6 +1190,12 @@ fn spawn_bootstrap_server(
             }
         }
     };
+    let clear_update_marker = has_pending_update
+        && (version_decision == DshVersionDecision::Current
+            || (matches!(
+                version_decision,
+                DshVersionDecision::Install | DshVersionDecision::Update
+            ) && final_result.is_ok()));
     if let Err(error) = final_result {
         if !had_existing || !bin.is_file() {
             return Err(error);
@@ -907,31 +1203,25 @@ fn spawn_bootstrap_server(
         log_line(log, &format!("dsh 更新失败,继续使用已安装版本: {error}"));
         set_loading_progress(window, 90, "两个源更新均失败,正在使用已安装的版本…");
     }
+    if clear_update_marker {
+        if let Err(error) = std::fs::remove_file(&update_marker) {
+            log_line(
+                log,
+                &format!(
+                    "无法删除 dsh 待更新标记 {}: {error}",
+                    update_marker.display()
+                ),
+            );
+        }
+    }
     if !bin.is_file() {
         return Err("npm 完成后未找到 @deepseek-ai/dsh/lib/bin.js".to_string());
     }
     let active_version = read_npm_package_version(&package_json);
     set_version_title(window, active_version.as_deref());
 
-    let mut command = Command::new(&node);
-    command
-        .arg(&bin)
-        .args(["web", "--port", &port.to_string()])
-        .current_dir(&root);
-    prepend_node_to_path(&mut command, &node)?;
-    #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
-    let (stdin, stdout, stderr) = child_stdio(log);
-    command.stdin(stdin).stdout(stdout).stderr(stderr);
-    let child = command
-        .spawn()
-        .map_err(|e| format!("无法启动网络安装的 dsh: {e}"))?;
     set_loading_progress(window, 94, "DeepSeek Harness 已就绪,正在启动服务…");
-
-    Ok((
-        child,
-        format!("{} {} web --port {port}", node.display(), bin.display()),
-    ))
+    spawn_dsh_web(&node, &root, &bin, port, log)
 }
 
 fn register_child(handle: &AppHandle, mut child: Child) -> Result<(), String> {
@@ -1064,7 +1354,7 @@ fn report_startup_error(
     handle
         .dialog()
         .message(msg)
-        .title("DeepSeek Harness Desktop")
+        .title("DeepSeek Harness")
         .kind(MessageDialogKind::Error)
         .show(|_| {});
 }
@@ -1224,7 +1514,8 @@ mod tests {
     #[test]
     fn dsh_version_check_only_installs_when_needed() {
         use super::{
-            decide_dsh_version, parse_npm_view_version, select_npx_dsh_root, DshVersionDecision,
+            decide_dsh_version, is_newer_dsh_version, parse_npm_view_version, select_npx_dsh_root,
+            start_before_update_check, DshVersionDecision,
         };
 
         assert_eq!(
@@ -1240,10 +1531,21 @@ mod tests {
             DshVersionDecision::Update
         );
         assert_eq!(
+            decide_dsh_version(true, Some("1.2.3"), Some("1.2.2")),
+            DshVersionDecision::Current
+        );
+        assert_eq!(
             decide_dsh_version(true, Some("1.2.3"), None),
             DshVersionDecision::UseExistingOffline
         );
         assert_eq!(parse_npm_view_version("\"1.2.3\"").unwrap(), "1.2.3");
+        assert!(is_newer_dsh_version("0.1.0-rc.6", "0.1.0-rc.7"));
+        assert!(is_newer_dsh_version("0.1.0-rc.6", "0.1.0"));
+        assert!(!is_newer_dsh_version("0.1.0", "0.1.0-rc.7"));
+        assert!(!is_newer_dsh_version("0.1.0", "invalid"));
+        assert!(start_before_update_check(true, false));
+        assert!(!start_before_update_check(true, true));
+        assert!(!start_before_update_check(false, false));
 
         let missing_root = std::env::temp_dir().join("dsh-npx-selection-missing");
         assert_eq!(
