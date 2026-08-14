@@ -1,0 +1,18 @@
+{
+  "name": "deepseek-harness-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "DeepSeek Harness desktop wrapper built with Tauri",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "check": "cargo check --manifest-path src-tauri/Cargo.toml --locked",
+    "lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml --locked"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

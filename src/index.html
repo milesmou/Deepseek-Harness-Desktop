@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DeepSeek Harness</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="card">
+      <div class="logo">🛠️</div>
+      <div class="spinner" id="spinner"></div>
+      <h1>DeepSeek Harness</h1>
+      <div
+        class="progress"
+        id="progress"
+        role="progressbar"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="0"
+      >
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div class="progress-value" id="progress-value">0%</div>
+      <p id="status">
+        正在启动 Harness 服务…<br />
+        首次运行可能需要安装或解压运行环境,请稍候。
+      </p>
+      <div class="error" id="error"></div>
+    </div>
+    <script src="loading.js"></script>
+  </body>
+</html>

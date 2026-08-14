@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Tauri CLI dependencies
+        run: npm ci
+
+      - name: Create resource placeholders
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src-tauri/resources/node | Out-Null
+          New-Item -ItemType Directory -Force src-tauri/resources/node_modules | Out-Null
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Lint
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Lint network-bootstrap mode
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features bootstrap --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Run network-bootstrap tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features bootstrap --locked

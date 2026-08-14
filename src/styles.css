@@ -1,0 +1,107 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0b0f1a;
+  color: #e6e9f2;
+  font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.card {
+  max-width: 560px;
+  padding: 0 24px;
+  text-align: center;
+}
+
+.logo {
+  font-size: 46px;
+}
+
+.spinner {
+  width: 44px;
+  height: 44px;
+  margin: 26px auto;
+  border: 4px solid rgba(90, 140, 255, 0.2);
+  border-top-color: #5a8cff;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.progress {
+  width: 320px;
+  max-width: 100%;
+  height: 8px;
+  margin: 22px auto 0;
+  overflow: hidden;
+  border: 1px solid rgba(90, 140, 255, 0.25);
+  border-radius: 999px;
+  background: rgba(90, 140, 255, 0.1);
+}
+
+.progress-bar {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #477cff, #76a0ff);
+  box-shadow: 0 0 12px rgba(90, 140, 255, 0.45);
+  transition: width 400ms ease;
+}
+
+.progress-value {
+  margin-top: 8px;
+  color: #a9b9dd;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+p {
+  margin-top: 10px;
+  color: #8b93a7;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.error {
+  display: none;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 99, 99, 0.35);
+  border-radius: 10px;
+  background: rgba(255, 99, 99, 0.08);
+  color: #ffb4b4;
+  font-size: 13px;
+  line-height: 1.7;
+  text-align: left;
+  white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
+}
