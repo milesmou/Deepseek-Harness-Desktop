@@ -63,9 +63,12 @@ const BOOTSTRAP_NODE_CHINA_URL: &str =
 const BOOTSTRAP_NODE_SHA256: &str =
     "edaca9bd58ec8e92037dac4e877d52f6b8f430b81c18b57e264b4e2fb111cd56";
 #[cfg(feature = "bootstrap")]
-const NPM_OFFICIAL_REGISTRY: &str = "https://registry.npmjs.org/";
+const NPM_HUAWEI_REGISTRY: &str = "https://repo.huaweicloud.com/repository/npm/";
 #[cfg(feature = "bootstrap")]
-const NPM_CHINA_REGISTRY: &str = "https://registry.npmmirror.com/";
+const NPM_TENCENT_REGISTRY: &str = "https://mirrors.cloud.tencent.com/npm/";
+#[cfg(feature = "bootstrap")]
+// npm/libnpmexec 对 "@deepseek-ai/dsh" 做 SHA-512 后取十六进制前 16 位。
+const DSH_NPX_CACHE_DIR: &str = "1e7f6d9597241db0";
 #[cfg(feature = "bootstrap")]
 const DSH_UPDATE_MARKER: &str = ".update-on-next-start";
 #[cfg(feature = "bootstrap")]
@@ -317,9 +320,9 @@ fn measure_source_latency(url: &str) -> Option<Duration> {
 }
 
 #[cfg(feature = "bootstrap")]
-fn prefer_china_source(china: Option<Duration>, official: Option<Duration>) -> bool {
-    match (china, official) {
-        (Some(china), Some(official)) => china <= official,
+fn prefer_first_source(first: Option<Duration>, second: Option<Duration>) -> bool {
+    match (first, second) {
+        (Some(first), Some(second)) => first <= second,
         (Some(_), None) => true,
         _ => false,
     }
@@ -354,7 +357,7 @@ fn select_fastest_source(
             official.join().unwrap_or(None),
         )
     });
-    let china_first = prefer_china_source(china_latency, official_latency);
+    let china_first = prefer_first_source(china_latency, official_latency);
     let (primary_name, primary_url, secondary_name, secondary_url) = if china_first {
         ("中国大陆源", china_url, "官网源", official_url)
     } else {
@@ -376,42 +379,49 @@ fn select_fastest_source(
 }
 
 #[cfg(feature = "bootstrap")]
-fn select_fastest_source_silent(
-    kind: &str,
-    china_url: &'static str,
-    official_url: &'static str,
-    log: &Option<File>,
-) -> SourceChoice {
-    let (china_latency, official_latency) = thread::scope(|scope| {
-        let china = scope.spawn(|| measure_source_latency(china_url));
-        let official = scope.spawn(|| measure_source_latency(official_url));
+fn select_dsh_registry(window: &WebviewWindow, progress: u8, log: &Option<File>) -> SourceChoice {
+    set_loading_progress(window, progress, "正在检测 dsh 镜像（华为云优先）…");
+    let choice = select_dsh_registry_silent(log);
+    set_loading_progress(
+        window,
+        progress.saturating_add(2),
+        &format!("dsh 镜像选择 {}", choice.primary_name),
+    );
+    choice
+}
+
+#[cfg(feature = "bootstrap")]
+fn select_dsh_registry_silent(log: &Option<File>) -> SourceChoice {
+    let (preferred_latency, secondary_latency) = thread::scope(|scope| {
+        let preferred = scope.spawn(|| measure_source_latency(NPM_HUAWEI_REGISTRY));
+        let secondary = scope.spawn(|| measure_source_latency(NPM_TENCENT_REGISTRY));
         (
-            china.join().unwrap_or(None),
-            official.join().unwrap_or(None),
+            preferred.join().unwrap_or(None),
+            secondary.join().unwrap_or(None),
         )
     });
-    let china_first = prefer_china_source(china_latency, official_latency);
-    let choice = if china_first {
+    let preferred_first = preferred_latency.is_some() || secondary_latency.is_none();
+    let choice = if preferred_first {
         SourceChoice {
-            primary_name: "中国大陆源",
-            primary_url: china_url,
-            secondary_name: "官网源",
-            secondary_url: official_url,
+            primary_name: "华为云",
+            primary_url: NPM_HUAWEI_REGISTRY,
+            secondary_name: "腾讯云",
+            secondary_url: NPM_TENCENT_REGISTRY,
         }
     } else {
         SourceChoice {
-            primary_name: "官网源",
-            primary_url: official_url,
-            secondary_name: "中国大陆源",
-            secondary_url: china_url,
+            primary_name: "腾讯云",
+            primary_url: NPM_TENCENT_REGISTRY,
+            secondary_name: "华为云",
+            secondary_url: NPM_HUAWEI_REGISTRY,
         }
     };
     log_line(
         log,
         &format!(
-            "{kind} 后台源测速:中国大陆 {}，官网 {}；选择 {}",
-            latency_text(china_latency),
-            latency_text(official_latency),
+            "dsh 镜像检测:华为云 {}，腾讯云 {}；选择 {}",
+            latency_text(preferred_latency),
+            latency_text(secondary_latency),
             choice.primary_name
         ),
     );
@@ -759,40 +769,8 @@ fn parse_npm_view_version(output: &str) -> Result<String, String> {
 }
 
 #[cfg(feature = "bootstrap")]
-fn has_dsh_runtime(root: &std::path::Path) -> bool {
-    root.join("node_modules")
-        .join("@deepseek-ai")
-        .join("dsh")
-        .join("lib")
-        .join("bin.js")
-        .is_file()
-}
-
-#[cfg(feature = "bootstrap")]
-fn select_npx_dsh_root(npx_root: &std::path::Path) -> std::path::PathBuf {
-    let preferred = npx_root.join("deepseek-harness-desktop");
-    if has_dsh_runtime(&preferred) {
-        return preferred;
-    }
-    std::fs::read_dir(npx_root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| {
-            let path = entry.path();
-            has_dsh_runtime(&path).then(|| {
-                let modified = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(UNIX_EPOCH);
-                (modified, path)
-            })
-        })
-        .max_by_key(|(modified, _)| *modified)
-        .map(|(_, path)| path)
-        .unwrap_or(preferred)
+fn dsh_npx_root(npx_root: &std::path::Path) -> std::path::PathBuf {
+    npx_root.join(DSH_NPX_CACHE_DIR)
 }
 
 #[cfg(feature = "bootstrap")]
@@ -807,12 +785,7 @@ fn schedule_background_update_check(
     let handle = handle.clone();
     let background_log = log.as_ref().and_then(|file| file.try_clone().ok());
     thread::spawn(move || {
-        let sources = select_fastest_source_silent(
-            "npm registry",
-            NPM_CHINA_REGISTRY,
-            NPM_OFFICIAL_REGISTRY,
-            &background_log,
-        );
+        let sources = select_dsh_registry_silent(&background_log);
         let make_query = |registry: &str| -> Result<Command, String> {
             let mut command = Command::new(&npm);
             command
@@ -967,7 +940,7 @@ fn spawn_bootstrap_server(
         .join("npm-cache")
         .join("_npx");
     std::fs::create_dir_all(&npx_root).map_err(|e| format!("无法创建 npm _npx 目录: {e}"))?;
-    let root = select_npx_dsh_root(&npx_root);
+    let root = dsh_npx_root(&npx_root);
     std::fs::create_dir_all(&root).map_err(|e| format!("无法创建 dsh 目录: {e}"))?;
     log_line(log, &format!("dsh npm 目录: {}", root.display()));
     let bin = root
@@ -1007,14 +980,7 @@ fn spawn_bootstrap_server(
         );
         set_loading_progress(window, 46, "检测到待更新版本,正在准备更新…");
     }
-    let mut npm_sources = select_fastest_source(
-        window,
-        46,
-        "npm registry",
-        NPM_CHINA_REGISTRY,
-        NPM_OFFICIAL_REGISTRY,
-        log,
-    );
+    let mut npm_sources = select_dsh_registry(window, 46, log);
 
     let make_version_query = |registry: &str| -> Result<Command, String> {
         let mut command = Command::new(&npm);
@@ -1491,22 +1457,22 @@ mod tests {
     #[cfg(feature = "bootstrap")]
     #[test]
     fn source_selection_prefers_available_lower_latency_source() {
-        use super::{https_host, prefer_china_source};
+        use super::{https_host, prefer_first_source};
         use std::time::Duration;
 
-        assert!(prefer_china_source(
+        assert!(prefer_first_source(
             Some(Duration::from_millis(20)),
             Some(Duration::from_millis(100))
         ));
-        assert!(!prefer_china_source(
+        assert!(!prefer_first_source(
             Some(Duration::from_millis(100)),
             Some(Duration::from_millis(20))
         ));
-        assert!(prefer_china_source(Some(Duration::from_millis(20)), None));
-        assert!(!prefer_china_source(None, None));
+        assert!(prefer_first_source(Some(Duration::from_millis(20)), None));
+        assert!(!prefer_first_source(None, None));
         assert_eq!(
-            https_host("https://registry.npmmirror.com/example"),
-            Some("registry.npmmirror.com")
+            https_host("https://repo.huaweicloud.com/repository/npm/example"),
+            Some("repo.huaweicloud.com")
         );
     }
 
@@ -1514,7 +1480,7 @@ mod tests {
     #[test]
     fn dsh_version_check_only_installs_when_needed() {
         use super::{
-            decide_dsh_version, is_newer_dsh_version, parse_npm_view_version, select_npx_dsh_root,
+            decide_dsh_version, dsh_npx_root, is_newer_dsh_version, parse_npm_view_version,
             start_before_update_check, DshVersionDecision,
         };
 
@@ -1549,8 +1515,8 @@ mod tests {
 
         let missing_root = std::env::temp_dir().join("dsh-npx-selection-missing");
         assert_eq!(
-            select_npx_dsh_root(&missing_root),
-            missing_root.join("deepseek-harness-desktop")
+            dsh_npx_root(&missing_root),
+            missing_root.join("1e7f6d9597241db0")
         );
     }
 }
