@@ -25,6 +25,8 @@
 
 Node 下载完成后使用官方 SHA-256 校验。首选源失败时自动切换备用源;dsh 默认使用华为云,华为云不可用、版本查询失败或安装失败时切换腾讯云。dsh 已安装但两个 registry 都无法查询时,直接使用本地版本。
 
+dsh 安装与更新在独立临时目录中分两阶段完成:先安装主包,再动态补齐必需的 peer dependencies;通过命令启动校验后才原子替换当前版本。版本查询超过 30 秒或单个安装阶段超过 10 分钟时会终止对应进程树,避免 loading 页无限等待。
+
 ## 安装目录
 
 - 自动安装的便携 Node:`%APPDATA%\com.deepseek.harness.desktop\bootstrap\node-v24.16.0-win-x64\`

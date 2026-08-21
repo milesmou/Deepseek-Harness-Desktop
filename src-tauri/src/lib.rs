@@ -17,6 +17,7 @@ compile_error!("工程仅保留网络引导版,必须启用 bootstrap feature");
 compile_error!("bootstrap 发布模式目前仅支持 Windows x64");
 
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
@@ -49,6 +50,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(400);
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_PROBE_BYTES: u64 = 256 * 1024;
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+#[cfg(feature = "bootstrap")]
+const VERSION_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "bootstrap")]
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[cfg(feature = "bootstrap")]
 const BOOTSTRAP_NODE_VERSION: &str = "24.16.0";
 #[cfg(feature = "bootstrap")]
@@ -134,7 +139,9 @@ fn response_is_harness(response: &str) -> bool {
         .lines()
         .next()
         .is_some_and(|line| line.starts_with("HTTP/1.1 200") || line.starts_with("HTTP/1.0 200"));
-    status_ok && response.contains("window.__DSH_BOOT__")
+    status_ok
+        && (response.contains("window.__DSH_BOOT__")
+            || response.contains(r#"globalThis["__DSH_BOOT__"]"#))
 }
 
 /// 不只检查端口，还确认首页是 Harness 服务端注入后的启动页。
@@ -463,6 +470,7 @@ fn run_managed_setup(
         .map_err(|e| format!("无法启动{label}: {e}"))?;
     register_child(handle, child)?;
     let started = Instant::now();
+    let deadline = started + SETUP_TIMEOUT;
     let mut last_reported_second = u64::MAX;
     set_loading_progress(window, progress_start, &format!("{label}…"));
 
@@ -471,6 +479,13 @@ fn run_managed_setup(
         if state.shutting_down.load(Ordering::SeqCst) {
             stop_managed_child(handle);
             return Err("应用正在退出".to_string());
+        }
+        if Instant::now() >= deadline {
+            stop_managed_child(handle);
+            return Err(format!(
+                "{label}超过 {} 分钟,已终止",
+                SETUP_TIMEOUT.as_secs() / 60
+            ));
         }
         let status = {
             let mut guard = state
@@ -539,6 +554,7 @@ fn run_managed_capture(
         .map_err(|e| format!("无法启动{label}: {e}"))?;
     register_child(handle, child)?;
     let started = Instant::now();
+    let deadline = started + VERSION_QUERY_TIMEOUT;
     let mut last_reported_second = u64::MAX;
     set_loading_progress(window, progress_start, &format!("{label}…"));
 
@@ -547,6 +563,13 @@ fn run_managed_capture(
         if state.shutting_down.load(Ordering::SeqCst) {
             stop_managed_child(handle);
             return Err("应用正在退出".to_string());
+        }
+        if Instant::now() >= deadline {
+            stop_managed_child(handle);
+            return Err(format!(
+                "{label}超过 {} 秒,已终止",
+                VERSION_QUERY_TIMEOUT.as_secs()
+            ));
         }
         let finished = {
             let mut guard = state
@@ -759,6 +782,231 @@ fn read_npm_package_version(package_json: &std::path::Path) -> Option<String> {
 }
 
 #[cfg(feature = "bootstrap")]
+fn collect_package_peers(
+    package_dir: &std::path::Path,
+    peers: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let package_json = package_dir.join("package.json");
+    let bytes = match std::fs::read(&package_json) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("无法读取 {}: {error}", package_json.display())),
+    };
+    let package: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("无法解析 {}: {error}", package_json.display()))?;
+    if let Some(required) = package
+        .get("peerDependencies")
+        .and_then(|value| value.as_object())
+    {
+        let metadata = package
+            .get("peerDependenciesMeta")
+            .and_then(|value| value.as_object());
+        for (name, version) in required {
+            let optional = metadata
+                .and_then(|entries| entries.get(name))
+                .and_then(|entry| entry.get("optional"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if !optional {
+                let version = version.as_str().ok_or_else(|| {
+                    format!(
+                        "{} 的 peer dependency {name} 版本无效",
+                        package_json.display()
+                    )
+                })?;
+                peers.insert(name.clone(), version.to_string());
+            }
+        }
+    }
+    collect_required_peers(&package_dir.join("node_modules"), peers)
+}
+
+#[cfg(feature = "bootstrap")]
+fn collect_required_peers(
+    node_modules: &std::path::Path,
+    peers: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(node_modules) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("无法读取 {}: {error}", node_modules.display())),
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("无法遍历 {}: {error}", node_modules.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法读取 {} 类型: {error}", entry.path().display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if name.to_string_lossy().starts_with('@') {
+            let scoped = std::fs::read_dir(entry.path())
+                .map_err(|error| format!("无法读取 {}: {error}", entry.path().display()))?;
+            for package in scoped {
+                let package = package
+                    .map_err(|error| format!("无法遍历 {}: {error}", entry.path().display()))?;
+                if package
+                    .file_type()
+                    .map(|kind| kind.is_dir())
+                    .unwrap_or(false)
+                {
+                    collect_package_peers(&package.path(), peers)?;
+                }
+            }
+        } else {
+            collect_package_peers(&entry.path(), peers)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bootstrap")]
+fn install_dsh_staged(
+    handle: &AppHandle,
+    window: &WebviewWindow,
+    npm: &std::path::Path,
+    node: &std::path::Path,
+    staging: &std::path::Path,
+    registry: &str,
+    label: &str,
+    progress_start: u8,
+    progress_end: u8,
+    log: &Option<File>,
+) -> Result<(), String> {
+    if staging.exists() {
+        std::fs::remove_dir_all(staging)
+            .map_err(|error| format!("无法清理临时安装目录 {}: {error}", staging.display()))?;
+    }
+    std::fs::create_dir_all(staging)
+        .map_err(|error| format!("无法创建临时安装目录 {}: {error}", staging.display()))?;
+
+    let span = progress_end.saturating_sub(progress_start);
+    let package_end = progress_start.saturating_add(span.saturating_mul(3) / 4);
+    let peers_end = progress_end.saturating_sub(1).max(package_end);
+    let mut package_install = Command::new(npm);
+    package_install
+        .args(["install", "--prefix"])
+        .arg(staging)
+        .args([
+            "@deepseek-ai/dsh@latest",
+            "--legacy-peer-deps",
+            "--omit=dev",
+            "--no-audit",
+            "--no-fund",
+            "--loglevel=warn",
+        ])
+        .env("NPM_CONFIG_REGISTRY", registry);
+    prepend_node_to_path(&mut package_install, node)?;
+    run_managed_setup(
+        handle,
+        window,
+        &mut package_install,
+        &format!("{label}：安装主包"),
+        progress_start,
+        package_end,
+        log,
+    )?;
+
+    let mut peers = BTreeMap::new();
+    collect_required_peers(&staging.join("node_modules"), &mut peers)?;
+    log_line(
+        log,
+        &format!("{label}:补齐 {} 个必需 peer dependencies", peers.len()),
+    );
+    if !peers.is_empty() {
+        let mut peer_install = Command::new(npm);
+        peer_install
+            .args(["install", "--prefix"])
+            .arg(staging)
+            .args([
+                "--save=false",
+                "--legacy-peer-deps",
+                "--omit=dev",
+                "--no-audit",
+                "--no-fund",
+                "--loglevel=warn",
+            ]);
+        for (name, version) in peers {
+            peer_install.arg(format!("{name}@{version}"));
+        }
+        peer_install.env("NPM_CONFIG_REGISTRY", registry);
+        prepend_node_to_path(&mut peer_install, node)?;
+        run_managed_setup(
+            handle,
+            window,
+            &mut peer_install,
+            &format!("{label}：补齐运行依赖"),
+            package_end,
+            peers_end,
+            log,
+        )?;
+    }
+
+    let bin = staging
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js");
+    let mut validate = Command::new(node);
+    validate.arg(&bin).arg("--help");
+    run_managed_setup(
+        handle,
+        window,
+        &mut validate,
+        &format!("{label}：校验运行环境"),
+        peers_end,
+        progress_end,
+        log,
+    )
+}
+
+#[cfg(feature = "bootstrap")]
+fn activate_staged_dsh(
+    root: &std::path::Path,
+    staging: &std::path::Path,
+    log: &Option<File>,
+) -> Result<(), String> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| "dsh 安装目录没有父目录".to_string())?;
+    let file_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "dsh 安装目录名称无效".to_string())?;
+    let backup = parent.join(format!("{file_name}.previous"));
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup)
+            .map_err(|error| format!("无法清理旧备份 {}: {error}", backup.display()))?;
+    }
+    let had_existing = root.exists();
+    if had_existing {
+        std::fs::rename(root, &backup)
+            .map_err(|error| format!("无法备份现有 dsh {}: {error}", root.display()))?;
+    }
+    if let Err(error) = std::fs::rename(staging, root) {
+        if had_existing {
+            let _ = std::fs::rename(&backup, root);
+        }
+        return Err(format!("无法启用新 dsh {}: {error}", root.display()));
+    }
+    if had_existing {
+        if let Err(error) = std::fs::remove_dir_all(&backup) {
+            log_line(
+                log,
+                &format!("无法清理 dsh 旧版本 {}: {error}", backup.display()),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bootstrap")]
 fn parse_npm_view_version(output: &str) -> Result<String, String> {
     serde_json::from_str::<String>(output)
         .or_else(|_| {
@@ -908,7 +1156,7 @@ fn spawn_dsh_web(
     let mut command = Command::new(node);
     command
         .arg(bin)
-        .args(["web", "--port", &port.to_string()])
+        .args(["web", "--port", &port.to_string(), "--no-open"])
         .current_dir(root);
     prepend_node_to_path(&mut command, node)?;
     #[cfg(target_os = "windows")]
@@ -920,7 +1168,11 @@ fn spawn_dsh_web(
         .map_err(|error| format!("无法启动网络安装的 dsh: {error}"))?;
     Ok((
         child,
-        format!("{} {} web --port {port}", node.display(), bin.display()),
+        format!(
+            "{} {} web --port {port} --no-open",
+            node.display(),
+            bin.display()
+        ),
     ))
 }
 
@@ -941,6 +1193,7 @@ fn spawn_bootstrap_server(
         .join("_npx");
     std::fs::create_dir_all(&npx_root).map_err(|e| format!("无法创建 npm _npx 目录: {e}"))?;
     let root = dsh_npx_root(&npx_root);
+    let staging = npx_root.join(format!("{DSH_NPX_CACHE_DIR}.installing"));
     std::fs::create_dir_all(&root).map_err(|e| format!("无法创建 dsh 目录: {e}"))?;
     log_line(log, &format!("dsh npm 目录: {}", root.display()));
     let bin = root
@@ -1064,23 +1317,6 @@ fn spawn_bootstrap_server(
         latest_version.as_deref(),
     );
 
-    let make_install = |registry: &str| -> Result<Command, String> {
-        let mut command = Command::new(&npm);
-        command
-            .args(["install", "--prefix"])
-            .arg(&root)
-            .args([
-                "@deepseek-ai/dsh@latest",
-                "--omit=dev",
-                "--no-audit",
-                "--no-fund",
-                "--loglevel=warn",
-            ])
-            .env("NPM_CONFIG_REGISTRY", registry);
-        prepend_node_to_path(&mut command, &node)?;
-        Ok(command)
-    };
-
     let final_result = match version_decision {
         DshVersionDecision::Current => {
             let version = installed_version.as_deref().unwrap_or("未知");
@@ -1122,10 +1358,27 @@ fn spawn_bootstrap_server(
                 ),
             );
             let primary_label = format!("dsh {action}（{}）", npm_sources.primary_name);
-            let mut install = make_install(npm_sources.primary_url)?;
-            let install_result =
-                run_managed_setup(handle, window, &mut install, &primary_label, 60, 88, log);
+            let install_result = install_dsh_staged(
+                handle,
+                window,
+                &npm,
+                &node,
+                &staging,
+                npm_sources.primary_url,
+                &primary_label,
+                60,
+                88,
+                log,
+            );
             if let Err(primary_error) = install_result {
+                // 退出/重启不是镜像故障。此时继续切源会让旧实例和新实例同时写同一 npm 目录。
+                if handle
+                    .state::<ServerProcess>()
+                    .shutting_down
+                    .load(Ordering::SeqCst)
+                {
+                    return Err(primary_error);
+                }
                 log_line(
                     log,
                     &format!(
@@ -1142,18 +1395,29 @@ fn spawn_bootstrap_server(
                     ),
                 );
                 let secondary_label = format!("dsh {action}（{}）", npm_sources.secondary_name);
-                let mut retry = make_install(npm_sources.secondary_url)?;
-                run_managed_setup(handle, window, &mut retry, &secondary_label, 72, 90, log)
-                    .map_err(|secondary_error| {
-                        format!(
-                            "两个 npm 源均失败；{}: {primary_error}；{}: {secondary_error}",
-                            npm_sources.primary_name, npm_sources.secondary_name
-                        )
-                    })
+                install_dsh_staged(
+                    handle,
+                    window,
+                    &npm,
+                    &node,
+                    &staging,
+                    npm_sources.secondary_url,
+                    &secondary_label,
+                    72,
+                    90,
+                    log,
+                )
+                .map_err(|secondary_error| {
+                    format!(
+                        "两个 npm 源均失败；{}: {primary_error}；{}: {secondary_error}",
+                        npm_sources.primary_name, npm_sources.secondary_name
+                    )
+                })
             } else {
-                set_loading_progress(window, 90, &format!("dsh {action}完成"));
                 Ok(())
             }
+            .and_then(|_| activate_staged_dsh(&root, &staging, log))
+            .map(|_| set_loading_progress(window, 90, &format!("dsh {action}完成")))
         }
     };
     let clear_update_marker = has_pending_update
@@ -1170,14 +1434,16 @@ fn spawn_bootstrap_server(
         set_loading_progress(window, 90, "两个源更新均失败,正在使用已安装的版本…");
     }
     if clear_update_marker {
-        if let Err(error) = std::fs::remove_file(&update_marker) {
-            log_line(
-                log,
-                &format!(
-                    "无法删除 dsh 待更新标记 {}: {error}",
-                    update_marker.display()
-                ),
-            );
+        if update_marker.exists() {
+            if let Err(error) = std::fs::remove_file(&update_marker) {
+                log_line(
+                    log,
+                    &format!(
+                        "无法删除 dsh 待更新标记 {}: {error}",
+                        update_marker.display()
+                    ),
+                );
+            }
         }
     }
     if !bin.is_file() {
@@ -1414,6 +1680,10 @@ mod tests {
         let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
                         <script>window.__DSH_BOOT__ = {}</script>";
         assert!(response_is_harness(response));
+
+        let current_response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+                                <script>globalThis[\"__DSH_BOOT__\"] = {}</script>";
+        assert!(response_is_harness(current_response));
     }
 
     #[test]
@@ -1518,5 +1788,32 @@ mod tests {
             dsh_npx_root(&missing_root),
             missing_root.join("1e7f6d9597241db0")
         );
+    }
+
+    #[cfg(feature = "bootstrap")]
+    #[test]
+    fn peer_dependency_collection_excludes_optional_entries() {
+        use super::collect_required_peers;
+        use std::collections::BTreeMap;
+
+        let root =
+            std::env::temp_dir().join(format!("dsh-peer-collection-test-{}", std::process::id()));
+        let package = root.join("node_modules").join("example");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{
+                "peerDependencies": { "required-peer": "^1", "optional-peer": "^2" },
+                "peerDependenciesMeta": { "optional-peer": { "optional": true } }
+            }"#,
+        )
+        .unwrap();
+
+        let mut peers = BTreeMap::new();
+        collect_required_peers(&root.join("node_modules"), &mut peers).unwrap();
+        assert_eq!(peers.get("required-peer").map(String::as_str), Some("^1"));
+        assert!(!peers.contains_key("optional-peer"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
